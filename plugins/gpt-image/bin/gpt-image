@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""GPT Image pictures through Codex CLI (the gpt-image catalog tool): prompt, references, folder -> PNG in the folder.
+
+    gpt-image --out <folder> [-i ref.png ...] [--n 1-4] [--name name] [--size 1024x1024] "<prompt>"
+    gpt-image --out <folder> --prompt-file prompt.md ...
+    gpt-image --out <folder> --batch frames.json [--jobs 1-4]
+
+Pictures are made in parallel, --jobs codex runs at once (3 by default; one picture takes 1-3.5 min, a batch of 10 one by
+one took 25 min): --n 4 is four codex runs, --batch is a list of pictures with their own prompts, references and names
+([{"prompt" | "prompt_file", "name", "images": [...], "size", "n"}]). On the ChatGPT limit the unfinished ones are
+retried one by one, up to 3 times (GPT_IMAGE_TRIES) after 2 min (GPT_IMAGE_PAUSE, s), with --jobs 1 too; before the
+pause stderr gets the line "GPT limit: retry i/3 in 2 min". Still failing -> it goes to "failed" with the error text
+(the time the limit lifts is in it).
+
+Restrictions (Oct 15: 4 copies of one batch into one folder, each 4 times slower): one generation per --out folder - a
+second run into the same folder while the first is alive exits at once with code 1 (the lock is the .gpt-image.lock
+file with a pid, a dead lock is removed); one picture takes at most 7 min (GPT_IMAGE_TIMEOUT, s), otherwise it goes to
+"failed"; every finished picture prints the line "done i/N: file" to stderr.
+
+GPT is shared by everyone: every codex run takes a slot (GPT_IMAGE_SLOTS, 4 by default) in the shared folder
+GPT_IMAGE_HOME/busy, hitting the limit pauses everyone (cooldown until HH:MM:SS). No free slot or a pause - the run
+waits its turn with the line "waiting for GPT: ..." in stderr and does not hammer the limit.
+`gpt-image --status` prints "GPT free: k of N slots" (exit code 0) or "GPT busy until HH:MM:SS: by whom" (exit code 2):
+free - send the next frame at once, do not wait.
+
+Codex generates with its image_generation tool on the ChatGPT subscription (sign in with `codex login`, no API key),
+the pictures go to OpenAI. Files are <name>-1.png, <name>-2.png... (taken numbers are skipped, old files are never
+overwritten). The result is the last line, JSON: {"files": [...]} (and "failed": [{"name", "reason"}] if some did not
+come out). Codex is taken from GPT_IMAGE_CODEX, PATH or ~/.local/bin/codex; the proxy from the environment
+(HTTPS_PROXY) codex picks up itself. Generation takes minutes: a session runs this in the background.
+Every codex run has its own CODEX_HOME (GPT_IMAGE_HOME/runs/..., ~/.cache/gpt-image/codex-home by default): the login is
+a link to the owner's auth.json, the owner's shared rules (~/.codex/AGENTS.md) do not interfere, pictures of neighbouring
+runs are not visible.
+
+Messages the user sees (stderr lines, errors, --status, "reason" in "failed") come in two languages, en and ru: the hub
+language (core.i18n, when the hub code is on PYTHONPATH) or the HUB_LANG environment variable; English by default.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+TIMEOUT = 7 * 60        # s per picture: the hub rule "longer than 7 min - investigate" (it was 20 min)
+LOCK = ".gpt-image.lock"
+WORK = "work"           # the model's folder inside the run home (-C): its copy is not a result
+# The lightest models first (codex itself would pick the owner's heavy one, gpt-6.1-sol, with effort high - Oct 21: the
+# picture ate the ChatGPT limit). A model the login does not accept ("The 'gpt-6-luna' model is not supported when using
+# Codex with a ChatGPT account", Oct 16 and 21) is remembered on this machine for UNSUPPORTED_TTL, and the next picture
+# does not spend a run on it; then the next one in the list. Never the owner's model from config.toml: it is the heavy
+# one. GPT_IMAGE_MODEL - your own: one model or a comma-separated list, taken as is, in that order.
+# Only the luna class ("fast and affordable"): terra, sol and astra are the balanced and the heavy ones - never, and none
+# of them is a fallback: no light model accepted - an error, not a quiet switch to a costly one.
+MODELS = ("gpt-6-luna", "gpt-5.6-luna")
+UNSUPPORTED = re.compile(r"model is not supported|model_not_found|does not exist or you do not have access", re.I)
+UNSUPPORTED_TTL = 12 * 3600   # s; the login may get the model later (GPT_IMAGE_UNSUPPORTED_TTL)
+EFFORT = "low"          # the least that gives a picture (GPT_IMAGE_EFFORT); the picture is made by the image tool, not by thinking
+# Oct 27: codex wraps even "Reply with OK" into ~19k input tokens: its own system prompt (18k characters), 40k characters
+# of tools (sub-agents, sleep, user questions), the owner's skills (25k characters), project docs, the environment. The
+# picture needs none of it: a one-line instruction instead of the system prompt, everything else off; what stays is the
+# image generation tool and the shell it is called through (exec). 19105 -> 4611 tokens on a text run (GPT_IMAGE_LEAN=0 - as before).
+LEAN_INSTRUCTIONS = "You draw pictures with the image generation tool. Do exactly what the user asks, answer briefly."
+LEAN_FEATURES = ("multi_agent", "multi_agent_v2", "sleep_tool", "goals", "memories", "apps", "plugins", "hooks",
+                 "skill_search", "tool_suggest", "view_image", "browser_use", "computer_use",
+                 "skill_mcp_dependency_install", "remote_plugin", "shell_snapshot")   # -c features.X=false: an unknown one is ignored
+LEAN_CONFIG = ("agents.enabled=false", "web_search=\"disabled\"", "project_doc_max_bytes=0", "skills.max_context_tokens=1")
+JOBS, MAX_JOBS = 3, 4   # codex runs at once: a ChatGPT subscription holds several generations; more - the limit hits more often
+STAGGER = 3             # s between starts: codex refreshes the login at start - not all at once
+PAUSE = 120             # s after hitting the limit - before every one-by-one retry (the GPT limit on
+TRIES = 3               # simultaneous generations lifts in a couple of minutes); at most TRIES retries, with --jobs 1 too
+# Oct 13: mid-batch the Codex login was switched to another account - the running ones got "token could not be refreshed"; a retry takes the new one
+SLOTS = 4               # GPT slots for everyone at once: the shared ChatGPT subscription limit on simultaneous generations
+TYPICAL = 180           # s per frame - for "busy until": a frame takes 1-3.5 min (Oct 13)
+POLL = 5                # s between checks for a free slot
+LIMIT = re.compile(r"usage limit|rate.?limit|too many requests|429|quota|could not be refreshed", re.I)
+
+# What the user sees: English by default, Russian when the hub language is Russian (anything else -> English).
+STR = {
+    "en": {
+        "no_codex": "gpt-image: codex not found - install Codex CLI (or ChatGPT.app) and sign in: codex login",
+        "folder_busy": "gpt-image: a generation is already running in {out} (pid {pid} since {at}) - wait for it or stop it",
+        "lock_failed": "gpt-image: could not take the lock {path}",
+        "waiting": "waiting for GPT: {status}",
+        "st_cooldown": "GPT busy until {until}: subscription limit (hit by {who})",
+        "st_free": "GPT free: {k} of {n} slots",
+        "st_taken": " (busy: {names})",
+        "st_busy": "GPT busy until ~{until}: {n} of {n} slots - {names}",
+        "timeout_min": "codex did not finish in {n} min",
+        "timeout_sec": "codex did not finish in {n} s",
+        "no_explanation": "codex exited with code {code}, no explanation",
+        "ready": "done {n}/{total}: {file}",
+        "retry": "GPT limit: retry {i}/{tries} in {wait}",
+        "wait_min": "{n} min",
+        "wait_sec": "{n} s",
+        "need_prompt": "gpt-image: a prompt is required",
+        "need_out": "--out is required",
+        "batch_list": "gpt-image: --batch must be a JSON list of pictures",
+        "no_reference": "gpt-image: reference not found: {files}",
+        "none_made": "gpt-image: no pictures were made - {reason}",
+        "using": "model {model}, effort {effort}",
+        "no_light": "no light model is accepted by this ChatGPT login ({tried}); a heavier one is not tried on purpose",
+        "which": "next picture: {models}, effort {effort}; refused on this machine: {refused}",
+        "none": "none",
+    },
+    "ru": {
+        "no_codex": "gpt-image: нет codex — поставьте Codex CLI (или ChatGPT.app) и войдите: codex login",
+        "folder_busy": "gpt-image: в {out} уже идёт генерация (pid {pid} с {at}) — дождись её или останови",
+        "lock_failed": "gpt-image: не удалось взять замок {path}",
+        "waiting": "жду GPT: {status}",
+        "st_cooldown": "GPT занят до {until}: лимит подписки (упёрся {who})",
+        "st_free": "GPT свободен: {k} из {n} мест",
+        "st_taken": " (заняты: {names})",
+        "st_busy": "GPT занят до ~{until}: {n} из {n} мест — {names}",
+        "timeout_min": "codex не уложился в {n} мин",
+        "timeout_sec": "codex не уложился в {n} с",
+        "no_explanation": "codex завершился с кодом {code}, без объяснения",
+        "ready": "готово {n}/{total}: {file}",
+        "retry": "лимит GPT: повтор {i}/{tries} через {wait}",
+        "wait_min": "{n} мин",
+        "wait_sec": "{n} с",
+        "need_prompt": "gpt-image: нужен промпт",
+        "need_out": "нужен --out",
+        "batch_list": "gpt-image: --batch — JSON-список картинок",
+        "no_reference": "gpt-image: нет референса: {files}",
+        "none_made": "gpt-image: картинок не получилось — {reason}",
+        "using": "модель {model}, effort {effort}",
+        "no_light": "ни одну лёгкую модель этот вход ChatGPT не принял ({tried}); тяжелее специально не пробую",
+        "which": "следующая картинка: {models}, effort {effort}; отказанные на этой машине: {refused}",
+        "none": "нет",
+    },
+}
+
+
+def _lang():
+    """Hub language: hub.json language -> owner language -> en (core.i18n, when the hub code is on PYTHONPATH);
+    without it - the HUB_LANG environment variable; otherwise en."""
+    try:
+        from core import i18n
+        return i18n.current()
+    except Exception:
+        return (os.environ.get("HUB_LANG") or "en").lower().replace("_", "-").split("-")[0]
+
+
+def tr(key, **values):
+    """A user-visible string in the hub language (looked up at the moment of use), {name} substitutions."""
+    return (STR.get(_lang()) or STR["en"]).get(key, STR["en"][key]).format(**values)
+
+
+def codex():
+    for c in (os.environ.get("GPT_IMAGE_CODEX"), shutil.which("codex"), os.path.expanduser("~/.local/bin/codex")):
+        if c and os.path.exists(c):
+            return c
+    sys.exit(tr("no_codex"))
+
+
+def isolated():
+    """Own CODEX_HOME per run, or None (no link possible - Windows without rights; then the usual codex home).
+    Oct 9: the shared ~/.codex/AGENTS.md demanded skills - codex refused to save the picture every other time.
+    Oct 14: there was one home for all runs - codex looked for a "fresh PNG" in the shared generated_images and with
+    parallel generations from different sessions put a foreign picture into the folder. The login is a link to the
+    owner's auth.json."""
+    real = os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"))
+    auth = os.path.join(real, "auth.json")
+    root = os.path.abspath(os.path.expanduser(os.environ.get("GPT_IMAGE_HOME") or "~/.cache/gpt-image/codex-home"))
+    if not os.path.isfile(auth) or root == real:
+        return None
+    try:
+        runs = os.path.join(root, "runs")
+        os.makedirs(runs, mode=0o700, exist_ok=True)
+        home = tempfile.mkdtemp(prefix="run-", dir=runs)
+        os.symlink(auth, os.path.join(home, "auth.json"))
+        open(os.path.join(home, "config.toml"), "w").close()
+    except OSError:
+        return None
+    return home
+
+
+def lean():
+    """Is the thin codex run on? (GPT_IMAGE_LEAN=0 turns it off)"""
+    return os.environ.get("GPT_IMAGE_LEAN", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def lean_args(instructions):
+    """codex flags that take the wrapper off: our one-line instructions file, no extra tools, skills, docs, web search.
+    The image generation tool and exec are not touched."""
+    path = instructions.replace("\\", "/")
+    args = ["-c", f'model_instructions_file="{path}"']
+    for c in LEAN_CONFIG:
+        args += ["-c", c]
+    for f in LEAN_FEATURES:
+        args += ["-c", f"features.{f}=false"]
+    return args
+
+
+def alive(pid):
+    """Is the process with this pid alive? Not os.kill(pid, 0): on Windows it terminates the process."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = ctypes.c_void_p
+        h = k.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return k.GetLastError() == 5        # access denied - the process exists
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))
+        k.CloseHandle(ctypes.c_void_p(h))
+        return bool(ok) and code.value == 259   # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def lock(out):
+    """Lock on the folder: a file with the pid and start time. Held by a live one - exit; a dead one (the session was
+    killed) - remove it and take it."""
+    path = os.path.join(out, LOCK)
+    for _ in range(5):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    pid, started = (f.read().split() + ["0", "0"])[:2]
+                pid, started = int(pid), float(started)
+            except (OSError, ValueError):
+                pid, started = 0, 0
+            if alive(pid):
+                at = time.strftime("%H:%M", time.localtime(started)) if started else "?"
+                sys.exit(tr("folder_busy", out=out, pid=pid, at=at))
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()} {time.time():.0f}\n")
+        return path
+    sys.exit(tr("lock_failed", path=path))
+
+
+def busy_dir():
+    root = os.path.abspath(os.path.expanduser(os.environ.get("GPT_IMAGE_HOME") or "~/.cache/gpt-image/codex-home"))
+    d = os.path.join(root, "busy")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def slots():
+    return max(1, int(os.environ.get("GPT_IMAGE_SLOTS", SLOTS)))
+
+
+def who():
+    return os.environ.get("HUB_SESSION") or f"pid {os.getpid()}"
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def taken_slots():
+    """Slots taken by live runs: [(slot, {pid, who, started, out})]; slots of dead ones (session killed) are removed."""
+    d, got = busy_dir(), []
+    for k in range(slots()):
+        p = os.path.join(d, f"slot-{k}.json")
+        if not os.path.exists(p):
+            continue
+        it = _read(p)
+        if it and alive(int(it.get("pid") or 0)):
+            got.append((k, it))
+        elif it is not None or time.time() - os.path.getmtime(p) > 10:   # empty - still being written: do not touch
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return got
+
+
+def cooldown():
+    """Pause for everyone after hitting the limit: {until, who}, or None if it is over."""
+    it = _read(os.path.join(busy_dir(), "cooldown.json"))
+    return it if it and float(it.get("until") or 0) > time.time() else None
+
+
+def set_cooldown(seconds):
+    if seconds <= 0:
+        return
+    p = os.path.join(busy_dir(), "cooldown.json")
+    until = time.time() + seconds
+    old = cooldown()
+    if old and float(old["until"]) >= until:
+        return
+    tmp = f"{p}.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"until": until, "who": who()}, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def hhmmss(t):
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def status():
+    """-> (free?, line): "GPT free: k of N slots" or "GPT busy until HH:MM:SS: by whom"."""
+    cd = cooldown()
+    if cd:
+        return False, tr("st_cooldown", until=hhmmss(float(cd["until"])), who=cd.get("who") or "?")
+    busy, n = taken_slots(), slots()
+    if len(busy) < n:
+        return True, tr("st_free", k=n - len(busy), n=n) + (
+            tr("st_taken", names=", ".join(sorted({it.get("who") or "?" for _, it in busy}))) if busy else "")
+    soon = min(float(it.get("started") or 0) for _, it in busy) + TYPICAL
+    names = ", ".join(sorted({it.get("who") or "?" for _, it in busy}))
+    return False, tr("st_busy", until=hhmmss(max(soon, time.time() + POLL)), n=n, names=names)
+
+
+def take_slot(out):
+    """A GPT slot for one codex run: a free one - at once, otherwise wait (a "waiting for GPT" line once a minute).
+    -> the slot's path."""
+    d, told = busy_dir(), 0.0
+    while True:
+        if not cooldown():
+            taken_slots()   # remove slots of dead runs
+            for k in range(slots()):
+                p = os.path.join(d, f"slot-{k}.json")
+                try:
+                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    continue
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({"pid": os.getpid(), "who": who(), "started": time.time(), "out": out}, f,
+                              ensure_ascii=False)
+                return p
+        if time.time() - told >= 60:
+            print(tr("waiting", status=status()[1]), file=sys.stderr, flush=True)
+            told = time.time()
+        time.sleep(float(os.environ.get("GPT_IMAGE_POLL", POLL)))
+
+
+def free_slot(p):
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
+def timeout():
+    return float(os.environ.get("GPT_IMAGE_TIMEOUT", TIMEOUT))
+
+
+SETTLE = threading.Lock()
+
+
+def settle(home):
+    """Codex refreshed the login and wrote auth.json as a file instead of a link - hand the fresh login to the owner:
+    otherwise his codex would keep the old, already revoked token. Remove the run home."""
+    link = os.path.join(home, "auth.json")
+    with SETTLE:
+        if os.path.isfile(link) and not os.path.islink(link):
+            real = os.path.join(os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")), "auth.json")
+            os.replace(link, real)
+    shutil.rmtree(home, ignore_errors=True)
+
+
+def take(home, path):
+    """The picture is put into the folder by the script, not by the model: its copy was taken as a "fresh PNG"
+    anywhere - with parallel runs a foreign picture or a file still being written (Oct 13: handles instead of sparks,
+    0 bytes). Only its own, from this run's home; no own - no picture."""
+    own = []
+    for root, dirs, files in os.walk(home):
+        dirs[:] = [d for d in dirs if d not in ("skills", "plugins", WORK)]   # skill icons and the model's copy are not a result
+        for f in files:
+            p = os.path.join(root, f)
+            if f.lower().endswith(".png") and os.path.getsize(p):
+                own.append((os.path.getmtime(p), p))
+    if not own:
+        if os.path.exists(path):
+            os.remove(path)   # the model put something there but there is no own picture - so it is not ours
+        return
+    tmp = path + ".part"
+    shutil.copyfile(max(own)[1], tmp)
+    os.replace(tmp, path)   # whole and at once: a reader never finds half a file
+
+
+def names(out, base, n, taken):
+    got, i = [], 1
+    while len(got) < n:
+        name = f"{base}-{i}.png"
+        if name not in taken and not os.path.exists(os.path.join(out, name)):
+            got.append(name)
+            taken.add(name)
+        i += 1
+    return got
+
+
+def task(prompt, refs, size):
+    """What the model is told. Short on purpose: it is only the hand of the image tool. The script takes the picture
+    from the run home itself (take), so the model neither saves nor copies nor looks at it - Oct 21: with "save under
+    this name" it read the image skill (25k characters), polled the tool and copied the file in a shell, about 170k
+    tokens a frame against 46k like this, and a minute longer."""
+    lines = ["Generate 1 image with your image generation tool. Pass this prompt to the tool as is, "
+             "without rewriting it:", "", prompt, ""]
+    if refs:
+        lines.append(f"Use the {len(refs)} attached image(s) as references, as the prompt describes.")
+    if size:
+        lines.append(f"Size: {size}.")
+    lines += ["Call the image generation tool directly: do not read skills or other files, do not save, copy or "
+              "inspect the result - the picture is collected from the tool's own folder. Reply with the word done only."]
+    return "\n".join(lines)
+
+
+def reason(r, said):
+    """Why there are no pictures (Oct 7: it was only "failed"): time ran out; error lines from codex output
+    (subscription limit, login, network and proxy); its last message; otherwise the exit code."""
+    if r is None:
+        t = timeout()
+        return tr("timeout_min", n=round(t / 60)) if t >= 60 else tr("timeout_sec", n=round(t))
+    errors = [x.strip() for x in (r.stderr or "").splitlines()
+              if re.search(r"error|limit|unauthori|forbidden|refus|denied|polic|proxy|connect|timed? ?out|429|403|401",
+                           x, re.I)]
+    parts = errors[-2:] + ([said] if said and said not in errors else [])
+    text = " · ".join(p for p in parts if p) or tr("no_explanation", code=r.returncode)
+    return text[:600]
+
+
+def codex_run(cmd, prompt, env):
+    """codex with the prompt on stdin -> CompletedProcess or None (did not finish in time). On timeout kill the whole
+    tree: on Windows codex is codex.cmd -> node, and kill stopped only cmd.exe, while node kept drawing the picture
+    after the deadline (Oct 16)."""
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding="utf-8", errors="replace", env=env)
+    try:
+        out, err = p.communicate(prompt, timeout=timeout())
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+        p.kill()
+        p.communicate()
+        return None
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+UNSUPPORTED_FILE = "unsupported.json"
+
+
+def unsupported():
+    """Models this login refused on this machine, still within the TTL: {model: when}."""
+    ttl = float(os.environ.get("GPT_IMAGE_UNSUPPORTED_TTL", UNSUPPORTED_TTL))
+    got = _read(os.path.join(busy_dir(), UNSUPPORTED_FILE))
+    return {m: t for m, t in (got or {}).items() if isinstance(t, (int, float)) and time.time() - t < ttl}
+
+
+def remember_unsupported(model):
+    p = os.path.join(busy_dir(), UNSUPPORTED_FILE)
+    with SETTLE:   # threads of one run; between processes the last writer wins - the lines it loses are re-learned
+        got = unsupported()
+        got[model] = time.time()
+        tmp = f"{p}.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(got, f)
+        os.replace(tmp, p)
+
+
+def models():
+    """Models to try, in order: GPT_IMAGE_MODEL as is, or the light ones without those this login already refused
+    (all refused - the whole list again: the memory may be stale)."""
+    own = [m.strip() for m in (os.environ.get("GPT_IMAGE_MODEL") or "").split(",") if m.strip()]
+    if own:
+        return own
+    refused = unsupported()
+    return [m for m in MODELS if m not in refused] or list(MODELS)
+
+
+def run(job, out):
+    """One picture: the first model of the list; the login did not accept it - remember that and take the next.
+    -> (file or None, why not)."""
+    explicit = bool(os.environ.get("GPT_IMAGE_MODEL"))
+    got, tried = (None, ""), []
+    for model in models():
+        tried.append(model)
+        got = attempt(job, out, model)
+        if got[0] or not UNSUPPORTED.search(got[1]):
+            return got
+        if not explicit:
+            remember_unsupported(model)
+    if not explicit:
+        got = (None, tr("no_light", tried=", ".join(tried)) + ": " + got[1])
+    return got
+
+
+def effort():
+    return os.environ.get("GPT_IMAGE_EFFORT") or EFFORT
+
+
+def attempt(job, out, model):
+    """One codex run - one picture. -> (file or None, why not)."""
+    last = tempfile.NamedTemporaryFile(prefix="gpt-image-", suffix=".txt", delete=False).name
+    home = isolated()
+    # Oct 16: the model put its own copy into --out - a foreign "fresh PNG", and until the run ended the folder held
+    # a suitcase instead of a magnet. The model writes into the run home; only take puts the picture into the folder
+    work = os.path.join(home, WORK) if home else out
+    if home:
+        os.makedirs(work, exist_ok=True)
+    print(tr("using", model=model, effort=effort()), file=sys.stderr, flush=True)   # which model bills the limit - visible
+    cmd = [codex(), "exec", "--skip-git-repo-check", "-C", work, "-s", "workspace-write", "-o", last,
+           "-m", model, "-c", f"model_reasoning_effort={effort()}"]
+    instructions = ""
+    if lean():
+        fd, instructions = tempfile.mkstemp(prefix="gpt-image-instr-", suffix=".txt", dir=home or None)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(LEAN_INSTRUCTIONS + "\n")
+        cmd += lean_args(instructions)
+    for r in job["refs"]:
+        cmd += ["-i", r]
+    # the prompt goes through stdin ("-"): on Windows codex is the codex.cmd wrapper, and cmd.exe cut a multi-line
+    # argument at the first line break (Oct 16: "no prompt appeared after the colon"); -i takes several values -
+    # without "--" it would swallow the "-"
+    cmd += ["--", "-"]
+    env = {**os.environ, "CODEX_HOME": home} if home else None
+    path = os.path.join(out, job["file"])
+    slot = take_slot(out)
+    try:
+        r = codex_run(cmd, task(job["prompt"], job["refs"], job["size"]), env)
+        if home and r is not None:
+            take(home, path)
+    finally:
+        free_slot(slot)
+        if instructions and not home:
+            try:
+                os.remove(instructions)
+            except OSError:
+                pass
+        if home:
+            settle(home)
+    said = ""
+    try:
+        with open(last, encoding="utf-8") as f:
+            said = f.read().strip()   # codex's last word: a moderation refusal, "could not" - in its own words
+        os.remove(last)
+    except OSError:
+        pass
+    if os.path.isfile(path) and os.path.getsize(path):
+        return path, ""
+    why = reason(r, said)
+    if LIMIT.search(why):   # the limit is a pause for everyone: other sessions do not hammer it, they wait
+        set_cooldown(float(os.environ.get("GPT_IMAGE_PAUSE", PAUSE)))
+    return None, why
+
+
+def generate(jobs, out, width):
+    """All pictures, width at once. On the limit - the unfinished ones one by one after a pause; the limit again - stop."""
+    done = {}
+    lock = threading.Lock()
+
+    def ready(got):
+        """Progress for the hub watcher: a line for every finished picture (call under lock)."""
+        if got[0]:
+            n = sum(1 for p, _ in done.values() if p)
+            print(tr("ready", n=n, total=len(jobs), file=os.path.basename(got[0])), file=sys.stderr, flush=True)
+
+    def one(i):
+        got = run(jobs[i], out)
+        with lock:
+            done[i] = got
+            ready(got)
+
+    with ThreadPoolExecutor(max_workers=width) as pool:
+        for k in range(len(jobs)):
+            if k and k < width:
+                time.sleep(float(os.environ.get("GPT_IMAGE_STAGGER", STAGGER)))
+            pool.submit(one, k)
+    pause = float(os.environ.get("GPT_IMAGE_PAUSE", PAUSE))
+    tries = int(os.environ.get("GPT_IMAGE_TRIES", TRIES))
+    for attempt in range(1, tries + 1):
+        again = [i for i, (path, why) in sorted(done.items()) if not path and LIMIT.search(why)]
+        if not again:
+            break
+        wait = tr("wait_min", n=round(pause / 60)) if pause >= 60 else tr("wait_sec", n=round(pause))
+        print(tr("retry", i=attempt, tries=tries, wait=wait), file=sys.stderr, flush=True)
+        time.sleep(pause)
+        for n, i in enumerate(again):
+            done[i] = run(jobs[i], out)
+            ready(done[i])
+            if not done[i][0] and LIMIT.search(done[i][1]):   # the limit again - the rest of this round do not try
+                for rest in again[n + 1:]:
+                    done[rest] = (None, done[i][1])
+                break
+    return [done[i] for i in range(len(jobs))]
+
+
+def where(p, base):
+    """A path from --batch is relative to that file's folder, as it was written."""
+    return os.path.abspath(os.path.join(base, os.path.expanduser(p)))
+
+
+def read_prompt(text, file):
+    prompt = open(file, encoding="utf-8").read() if file else text
+    if not (prompt or "").strip():
+        sys.exit(tr("need_prompt"))
+    return prompt.strip()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="gpt-image")
+    ap.add_argument("prompt", nargs="?")
+    ap.add_argument("--prompt-file")
+    ap.add_argument("--out")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--which-model", action="store_true", help="print which model the next picture goes to; no run")
+    ap.add_argument("-i", "--image", action="append", default=[])
+    ap.add_argument("--n", type=int, default=1)
+    ap.add_argument("--name", default="image")
+    ap.add_argument("--size")
+    ap.add_argument("--batch")
+    ap.add_argument("--jobs", type=int, default=JOBS)
+    a = ap.parse_args()
+    if a.status:
+        free, line = status()
+        print(line)
+        sys.exit(0 if free else 2)
+    if a.which_model:
+        refused = sorted(unsupported())
+        print(tr("which", models=", ".join(models()), effort=effort(), refused=", ".join(refused) or tr("none")))
+        sys.exit(0)
+    if not a.out:
+        ap.error(tr("need_out"))
+    if a.batch:
+        with open(os.path.expanduser(a.batch), encoding="utf-8") as f:
+            items = json.load(f)
+        if not isinstance(items, list) or not items:
+            sys.exit(tr("batch_list"))
+        base = os.path.dirname(os.path.abspath(os.path.expanduser(a.batch)))
+    else:
+        base = os.getcwd()
+        items = [{"prompt": a.prompt, "prompt_file": a.prompt_file, "images": a.image, "n": a.n, "name": a.name,
+                  "size": a.size}]
+    out = os.path.abspath(os.path.expanduser(a.out))
+    parsed = []
+    for it in items:
+        prompt = read_prompt(it.get("prompt"), it.get("prompt_file") and where(it["prompt_file"], base))
+        refs = [where(r, base) for r in it.get("images") or []]
+        missing = [r for r in refs if not os.path.isfile(r)]
+        if missing:
+            sys.exit(tr("no_reference", files=", ".join(missing)))
+        parsed.append((prompt, refs, it.get("size") or a.size, it.get("name") or "image",
+                       max(1, min(4, int(it.get("n") or 1)))))
+    os.makedirs(out, exist_ok=True)
+    held = lock(out)   # file names are taken already under the lock: a parallel run will not take the same ones
+    try:
+        jobs, taken = [], set()
+        for prompt, refs, size, name, n in parsed:
+            jobs += [{"prompt": prompt, "refs": refs, "size": size, "file": f} for f in names(out, name, n, taken)]
+        got = generate(jobs, out, max(1, min(MAX_JOBS, a.jobs, len(jobs))))
+    finally:
+        try:
+            os.remove(held)
+        except OSError:
+            pass
+    made = [path for path, _ in got if path]
+    failed = [{"name": j["file"], "reason": why} for j, (path, why) in zip(jobs, got) if not path]
+    if not made:
+        sys.exit(tr("none_made", reason=failed[0]["reason"]))
+    print(json.dumps({"files": made, **({"failed": failed} if failed else {})}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
